@@ -2,7 +2,7 @@
 // Build: g++ -std=c++20 -O2 -Wall -Wextra project10_lsm_kv.cpp -o lsm
 //
 // Usage:
-//   ./lsm              interactive shell (data kept in ./lsm_data between runs)
+//   ./lsm              interactive shell: type 'help' (data kept in ./lsm_data between runs)
 //   ./lsm <dir>        interactive shell using a custom data directory
 //   ./lsm --demo       run the built-in correctness test (20,000 keys, flushes, compaction, recovery)
 //
@@ -13,8 +13,11 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cctype>
 #include <filesystem>
+#include <functional>
 #include <iostream>
+#include <memory>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -174,6 +177,7 @@ struct Options {
     size_t memtable_bytes = 1 << 20;
     size_t compact_at_tables = 4;
     bool sync_wal = false; // true = fsync every write (durable, slower)
+    std::function<void(const std::string&)> log; // optional: report engine events (flush, compaction, recovery)
 };
 
 class DB {
@@ -211,7 +215,18 @@ public:
     size_t table_count() const { return tables_.size(); }
     size_t memtable_entries() const { return mem_.size(); }
 
+    // All live (non-deleted) key/value pairs, newest version of each key.
+    std::map<std::string, std::string> snapshot() const {
+        std::map<std::string, Val> merged;
+        for (auto& t : tables_) t.read_all(merged); // oldest -> newest
+        for (auto& [k, v] : mem_) merged[k] = v;
+        std::map<std::string, std::string> out;
+        for (auto& [k, v] : merged) if (!v.deleted) out[k] = v.value;
+        return out;
+    }
+
 private:
+    void note(const std::string& m) const { if (opt_.log) opt_.log(m); }
     std::string wal_path() const { return dir_ + "/wal.log"; }
     std::string sst_path(uint64_t id) const {
         char buf[32];
@@ -237,18 +252,23 @@ private:
         std::string k;
         Val v;
         uint32_t crc;
+        size_t replayed = 0;
         while (std::fread(&crc, 4, 1, f) == 1 && read_entry(f, k, v)) {
             if (crc != fnv1a(encode(k, v))) break; // torn or corrupt tail: stop replay here
             mem_[k] = v;
             mem_bytes_ += k.size() + v.value.size() + 16;
+            ++replayed;
         }
         std::fclose(f);
+        if (replayed) note("recovered " + std::to_string(replayed) + " recent writes from the write-ahead log");
     }
 
     void flush() {
         if (mem_.empty()) return;
         uint64_t id = next_id_++;
         SSTable::write(sst_path(id), mem_);
+        note("memory was full: saved " + std::to_string(mem_.size()) + " entries to " +
+             fs::path(sst_path(id)).filename().string());
         tables_.push_back(SSTable::load(sst_path(id), id));
         mem_.clear();
         mem_bytes_ = 0;
@@ -264,6 +284,8 @@ private:
         SSTable::write(sst_path(id), merged); // new file has the highest id, so it shadows the old ones
         std::vector<std::string> old;
         for (auto& t : tables_) old.push_back(t.path);
+        note("too many tables: merged " + std::to_string(old.size()) + " into " +
+             fs::path(sst_path(id)).filename().string() + " (" + std::to_string(merged.size()) + " keys)");
         tables_.clear();
         tables_.push_back(SSTable::load(sst_path(id), id));
         for (auto& p : old) fs::remove(p);
@@ -279,61 +301,126 @@ private:
 };
 
 // ---------- Interactive shell ----------
-static void list_files(const std::string& dir) {
+static std::string lower(std::string s) {
+    for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+static void list_files(const std::string& dir, bool explain = false) {
     std::vector<std::pair<std::string, std::uintmax_t>> files;
     for (auto& e : fs::directory_iterator(dir))
         if (e.is_regular_file()) files.emplace_back(e.path().filename().string(), e.file_size());
     std::sort(files.begin(), files.end());
-    if (files.empty()) std::cout << "  (no files)\n";
-    for (auto& [name, size] : files) std::cout << "  " << name << "  (" << size << " bytes)\n";
+    if (files.empty()) std::cout << "  (no files yet)\n";
+    for (auto& [name, size] : files) {
+        std::cout << "  " << name << "  (" << size << " bytes)";
+        if (explain) {
+            if (name == "wal.log") std::cout << "  <- log of recent writes, used to recover after a crash";
+            else if (name.rfind("sst_", 0) == 0) std::cout << "  <- sorted table saved on disk";
+        }
+        std::cout << "\n";
+    }
+}
+
+static void print_help() {
+    std::cout <<
+        "\nCommands\n"
+        "  put <key> <value>   save a value               e.g.  put name Regis\n"
+        "  get <key>           look a value up            e.g.  get name\n"
+        "  del <key>           delete a key               e.g.  del name\n"
+        "  list                show every key and value\n"
+        "  fill <n>            write n sample keys         e.g.  fill 500\n"
+        "                      (watch the [engine] lines to see flushes and compaction)\n"
+        "  stats               what is in memory vs. on disk\n"
+        "  files               show the files in the data folder\n"
+        "  reset               erase all data and start fresh\n"
+        "  help                show this list\n"
+        "  quit                exit (data is saved; run again and it comes back)\n"
+        "\nKeys are one word. Values can contain spaces.\n\n";
 }
 
 static int shell(const std::string& dir) {
     Options opt;
     opt.memtable_bytes = 4 * 1024; // small, so a few hundred writes trigger flushes and compaction
-    DB db(dir, opt);
-    std::cout << "LSM store in " << dir << "  (" << db.table_count() << " sstables, "
-              << db.memtable_entries() << " entries recovered into memory)\n"
-              << "Commands: put <key> <value> | get <key> | del <key> | fill <n> | stats | files | quit\n";
+    opt.log = [](const std::string& m) { std::cout << "  [engine] " << m << "\n"; };
+    auto db = std::make_unique<DB>(dir, opt);
+
+    std::cout << "\nLSM key-value store     data folder: " << dir << "\n"
+              << "Quick start:   put name Regis   then   get name   then   quit\n"
+              << "Run it again afterward and your data will still be there.\n"
+              << "Type 'help' for all commands.\n\n";
+
     std::string line;
-    while (std::cout << "> " && std::getline(std::cin, line)) {
+    while (std::cout << "lsm> " && std::getline(std::cin, line)) {
         std::istringstream in(line);
         std::string cmd, key;
         in >> cmd;
+        cmd = lower(cmd);
         if (cmd.empty()) continue;
-        if (cmd == "quit" || cmd == "exit") break;
-        if (cmd == "put") {
+
+        if (cmd == "quit" || cmd == "exit" || cmd == "q") break;
+
+        if (cmd == "help" || cmd == "?") {
+            print_help();
+        } else if (cmd == "put" || cmd == "set") {
             std::string value;
             in >> key;
             std::getline(in >> std::ws, value);
-            if (key.empty() || value.empty()) { std::cout << "usage: put <key> <value>\n"; continue; }
-            db.put(key, value);
-            std::cout << "OK\n";
+            if (key.empty() || value.empty()) { std::cout << "Usage: put <key> <value>      e.g.  put name Regis\n"; continue; }
+            db->put(key, value);
+            std::cout << "Saved: " << key << " = " << value << "\n";
         } else if (cmd == "get") {
             in >> key;
-            auto r = db.get(key);
-            std::cout << (r ? *r : std::string("(not found)")) << "\n";
-        } else if (cmd == "del") {
+            if (key.empty()) { std::cout << "Usage: get <key>      e.g.  get name\n"; continue; }
+            auto r = db->get(key);
+            if (r) std::cout << key << " = " << *r << "\n";
+            else std::cout << key << ": not found\n";
+        } else if (cmd == "del" || cmd == "delete") {
             in >> key;
-            db.del(key);
-            std::cout << "OK\n";
+            if (key.empty()) { std::cout << "Usage: del <key>      e.g.  del name\n"; continue; }
+            if (!db->get(key)) { std::cout << key << ": not found, nothing to delete\n"; continue; }
+            db->del(key);
+            std::cout << "Deleted: " << key << "\n";
+        } else if (cmd == "list" || cmd == "ls") {
+            auto all = db->snapshot();
+            if (all.empty()) std::cout << "(empty) try:  put name Regis\n";
+            for (auto& [k, v] : all) std::cout << "  " << k << " = " << v << "\n";
+            if (!all.empty()) std::cout << all.size() << " key(s)\n";
         } else if (cmd == "fill") {
             int n = 0;
             in >> n;
+            if (n <= 0 || n > 100000) { std::cout << "Usage: fill <n>   with n from 1 to 100000   e.g.  fill 500\n"; continue; }
             for (int i = 0; i < n; ++i) {
                 char k[32];
                 std::snprintf(k, sizeof k, "bulk%06d", i);
-                db.put(k, "value-" + std::to_string(i));
+                db->put(k, "value-" + std::to_string(i));
             }
-            std::cout << "wrote " << n << " keys; sstables now: " << db.table_count() << "\n";
+            std::cout << "Wrote " << n << " sample keys (bulk000000 ...). Tables on disk: " << db->table_count() << "\n";
         } else if (cmd == "stats") {
-            std::cout << "sstables: " << db.table_count() << ", entries in memtable: " << db.memtable_entries() << "\n";
+            std::error_code ec;
+            auto wal = fs::file_size(dir + "/wal.log", ec);
+            std::cout << "  In memory (not yet in a table): " << db->memtable_entries() << " entries\n"
+                      << "  Sorted tables on disk:          " << db->table_count() << "\n"
+                      << "  Write-ahead log size:           " << (ec ? 0 : wal) << " bytes\n";
         } else if (cmd == "files") {
-            list_files(dir);
+            list_files(dir, true);
+        } else if (cmd == "reset") {
+            std::cout << "This erases ALL data in " << dir << ". Type 'yes' to confirm: ";
+            std::string answer;
+            std::getline(std::cin, answer);
+            if (lower(answer) == "yes") {
+                db.reset(); // close files before deleting them
+                fs::remove_all(dir);
+                db = std::make_unique<DB>(dir, opt);
+                std::cout << "All data erased.\n";
+            } else {
+                std::cout << "Cancelled.\n";
+            }
         } else {
-            std::cout << "unknown command\n";
+            std::cout << "Unknown command '" << cmd << "'. Type 'help' to see what you can do.\n";
         }
     }
+    std::cout << "\nGoodbye. Your data is saved in " << dir << " - run ./lsm again to see it recovered.\n";
     return 0;
 }
 
