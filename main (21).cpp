@@ -1,10 +1,15 @@
-//Small LSM-tree key-value store: WAL + memtable + SSTables + Bloom filters + compaction.
+// Project 10: Small LSM-tree key-value store: WAL + memtable + SSTables + Bloom filters + compaction.
 // Build: g++ -std=c++20 -O2 -Wall -Wextra project10_lsm_kv.cpp -o lsm
 //
-// Layout on disk:  <dir>/wal.log           write-ahead log (checksummed records)
-//                  <dir>/sst_<id>.dat      immutable sorted tables, higher id = newer
-// Known limits (good "future work" bullets): compaction merges everything in memory and keeps
-// tombstones (a manifest file would make dropping them crash-safe); no block cache; single writer.
+// Usage:
+//   ./lsm              interactive shell (data kept in ./lsm_data between runs)
+//   ./lsm <dir>        interactive shell using a custom data directory
+//   ./lsm --demo       run the built-in correctness test (20,000 keys, flushes, compaction, recovery)
+//
+// Layout on disk: <dir>/wal.log   write-ahead log (checksummed records)
+//                 <dir>/sst_<id>.dat  immutable sorted tables, higher id = newer
+// Known limits: compaction merges everything in memory and keeps tombstones (a manifest file
+// would make dropping them crash-safe); no block cache; single writer.
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -12,6 +17,7 @@
 #include <iostream>
 #include <map>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
@@ -21,7 +27,7 @@ namespace fs = std::filesystem;
 
 struct Val {
     std::string value;
-    bool deleted = false;  // tombstone
+    bool deleted = false; // tombstone
 };
 
 // ---------- encoding helpers ----------
@@ -52,7 +58,7 @@ static bool read_entry(FILE* f, std::string& k, Val& v) {
     uint8_t t;
     if (std::fread(&kl, 4, 1, f) != 1 || std::fread(&vl, 4, 1, f) != 1 || std::fread(&t, 1, 1, f) != 1)
         return false;
-    if (kl > (1u << 28) || vl > (1u << 28)) return false;  // corrupt length guard
+    if (kl > (1u << 28) || vl > (1u << 28)) return false; // corrupt length guard
     k.resize(kl);
     v.value.resize(vl);
     if (kl && std::fread(k.data(), 1, kl, f) != kl) return false;
@@ -65,7 +71,7 @@ static bool read_entry(FILE* f, std::string& k, Val& v) {
 class Bloom {
 public:
     void init(size_t n) {
-        nbits_ = std::max<size_t>(64, n * 10);  // ~1% false positives with 4 hashes
+        nbits_ = std::max<size_t>(64, n * 10); // ~1% false positives with 4 hashes
         bits_.assign((nbits_ + 63) / 64, 0);
     }
     void add(const std::string& k) {
@@ -90,7 +96,7 @@ private:
 
 // ---------- SSTable ----------
 struct SSTable {
-    static constexpr size_t kIndexEvery = 16;  // sparse index: one entry per 16 keys
+    static constexpr size_t kIndexEvery = 16; // sparse index: one entry per 16 keys
     std::string path;
     uint64_t id = 0;
     Bloom bloom;
@@ -108,7 +114,7 @@ struct SSTable {
         std::fflush(f);
         ::fsync(fileno(f));
         std::fclose(f);
-        fs::rename(tmp, path);  // atomic publish
+        fs::rename(tmp, path); // atomic publish
     }
 
     static SSTable load(const std::string& path, uint64_t id) {
@@ -138,7 +144,7 @@ struct SSTable {
         if (index.empty() || key < min_key || key > max_key || !bloom.may_contain(key)) return false;
         auto it = std::upper_bound(index.begin(), index.end(), key,
                                    [](const std::string& k, const auto& e) { return k < e.first; });
-        --it;  // safe: key >= min_key == index[0].first
+        --it; // safe: key >= min_key == index[0].first
         FILE* f = std::fopen(path.c_str(), "rb");
         if (!f) return false;
         std::fseek(f, it->second, SEEK_SET);
@@ -158,7 +164,7 @@ struct SSTable {
         if (!f) throw std::runtime_error("cannot open " + path);
         std::string k;
         Val v;
-        while (read_entry(f, k, v)) into[k] = v;  // later (newer) tables overwrite earlier ones
+        while (read_entry(f, k, v)) into[k] = v; // later (newer) tables overwrite earlier ones
         std::fclose(f);
     }
 };
@@ -167,7 +173,7 @@ struct SSTable {
 struct Options {
     size_t memtable_bytes = 1 << 20;
     size_t compact_at_tables = 4;
-    bool sync_wal = false;  // true = fsync every write (durable, slower)
+    bool sync_wal = false; // true = fsync every write (durable, slower)
 };
 
 class DB {
@@ -180,7 +186,7 @@ public:
             if (name.rfind("sst_", 0) == 0 && name.size() > 4 && e.path().extension() == ".dat")
                 files.emplace_back(std::stoull(name.substr(4)), e.path().string());
             else if (e.path().extension() == ".tmp")
-                fs::remove(e.path());  // unfinished flush/compaction from a crash
+                fs::remove(e.path()); // unfinished flush/compaction from a crash
         }
         std::sort(files.begin(), files.end());
         for (auto& [id, p] : files) { tables_.push_back(SSTable::load(p, id)); next_id_ = id + 1; }
@@ -197,12 +203,13 @@ public:
         if (auto it = mem_.find(k); it != mem_.end())
             return it->second.deleted ? std::nullopt : std::optional(it->second.value);
         Val v;
-        for (auto t = tables_.rbegin(); t != tables_.rend(); ++t)  // newest first
+        for (auto t = tables_.rbegin(); t != tables_.rend(); ++t) // newest first
             if (t->get(k, v)) return v.deleted ? std::nullopt : std::optional(v.value);
         return std::nullopt;
     }
 
     size_t table_count() const { return tables_.size(); }
+    size_t memtable_entries() const { return mem_.size(); }
 
 private:
     std::string wal_path() const { return dir_ + "/wal.log"; }
@@ -231,7 +238,7 @@ private:
         Val v;
         uint32_t crc;
         while (std::fread(&crc, 4, 1, f) == 1 && read_entry(f, k, v)) {
-            if (crc != fnv1a(encode(k, v))) break;  // torn or corrupt tail: stop replay here
+            if (crc != fnv1a(encode(k, v))) break; // torn or corrupt tail: stop replay here
             mem_[k] = v;
             mem_bytes_ += k.size() + v.value.size() + 16;
         }
@@ -245,16 +252,16 @@ private:
         tables_.push_back(SSTable::load(sst_path(id), id));
         mem_.clear();
         mem_bytes_ = 0;
-        std::fclose(wal_);  // crash before this truncation only replays duplicates: harmless
+        std::fclose(wal_); // crash before this truncation only replays duplicates: harmless
         wal_ = std::fopen(wal_path().c_str(), "wb");
         if (tables_.size() >= opt_.compact_at_tables) compact();
     }
 
     void compact() {
         std::map<std::string, Val> merged;
-        for (auto& t : tables_) t.read_all(merged);  // oldest -> newest
+        for (auto& t : tables_) t.read_all(merged); // oldest -> newest
         uint64_t id = next_id_++;
-        SSTable::write(sst_path(id), merged);  // new file has the highest id, so it shadows the old ones
+        SSTable::write(sst_path(id), merged); // new file has the highest id, so it shadows the old ones
         std::vector<std::string> old;
         for (auto& t : tables_) old.push_back(t.path);
         tables_.clear();
@@ -271,17 +278,77 @@ private:
     uint64_t next_id_ = 1;
 };
 
-int main() {
+// ---------- Interactive shell ----------
+static void list_files(const std::string& dir) {
+    std::vector<std::pair<std::string, std::uintmax_t>> files;
+    for (auto& e : fs::directory_iterator(dir))
+        if (e.is_regular_file()) files.emplace_back(e.path().filename().string(), e.file_size());
+    std::sort(files.begin(), files.end());
+    if (files.empty()) std::cout << "  (no files)\n";
+    for (auto& [name, size] : files) std::cout << "  " << name << "  (" << size << " bytes)\n";
+}
+
+static int shell(const std::string& dir) {
+    Options opt;
+    opt.memtable_bytes = 4 * 1024; // small, so a few hundred writes trigger flushes and compaction
+    DB db(dir, opt);
+    std::cout << "LSM store in " << dir << "  (" << db.table_count() << " sstables, "
+              << db.memtable_entries() << " entries recovered into memory)\n"
+              << "Commands: put <key> <value> | get <key> | del <key> | fill <n> | stats | files | quit\n";
+    std::string line;
+    while (std::cout << "> " && std::getline(std::cin, line)) {
+        std::istringstream in(line);
+        std::string cmd, key;
+        in >> cmd;
+        if (cmd.empty()) continue;
+        if (cmd == "quit" || cmd == "exit") break;
+        if (cmd == "put") {
+            std::string value;
+            in >> key;
+            std::getline(in >> std::ws, value);
+            if (key.empty() || value.empty()) { std::cout << "usage: put <key> <value>\n"; continue; }
+            db.put(key, value);
+            std::cout << "OK\n";
+        } else if (cmd == "get") {
+            in >> key;
+            auto r = db.get(key);
+            std::cout << (r ? *r : std::string("(not found)")) << "\n";
+        } else if (cmd == "del") {
+            in >> key;
+            db.del(key);
+            std::cout << "OK\n";
+        } else if (cmd == "fill") {
+            int n = 0;
+            in >> n;
+            for (int i = 0; i < n; ++i) {
+                char k[32];
+                std::snprintf(k, sizeof k, "bulk%06d", i);
+                db.put(k, "value-" + std::to_string(i));
+            }
+            std::cout << "wrote " << n << " keys; sstables now: " << db.table_count() << "\n";
+        } else if (cmd == "stats") {
+            std::cout << "sstables: " << db.table_count() << ", entries in memtable: " << db.memtable_entries() << "\n";
+        } else if (cmd == "files") {
+            list_files(dir);
+        } else {
+            std::cout << "unknown command\n";
+        }
+    }
+    return 0;
+}
+
+// ---------- Built-in correctness test ----------
+static int demo() {
     const std::string dir = "./lsm_demo";
     fs::remove_all(dir);
     Options opt;
-    opt.memtable_bytes = 64 * 1024;  // tiny, to force many flushes and compactions
+    opt.memtable_bytes = 64 * 1024; // tiny, to force many flushes and compactions
 
     const int N = 20000;
     auto key = [](int i) { char b[32]; std::snprintf(b, sizeof b, "key%06d", i); return std::string(b); };
     auto expect = [](int i) -> std::optional<std::string> {
-        if (i % 7 == 0) return std::nullopt;                 // deleted
-        if (i % 5 == 0) return "updated-" + std::to_string(i);  // overwritten
+        if (i % 7 == 0) return std::nullopt; // deleted
+        if (i % 5 == 0) return "updated-" + std::to_string(i); // overwritten
         return "value-" + std::to_string(i);
     };
     auto verify = [&](DB& db, const char* label) {
@@ -299,14 +366,18 @@ int main() {
         for (int i = 0; i < N; ++i) db.put(key(i), "value-" + std::to_string(i));
         for (int i = 0; i < N; i += 5) db.put(key(i), "updated-" + std::to_string(i));
         for (int i = 0; i < N; i += 7) db.del(key(i));
-        ok &= verify(db, "live reads  ");
+        ok &= verify(db, "live reads ");
     }
-    {   // reopen: recovers tables from disk and the unflushed tail from the WAL
+    { // reopen: recovers tables from disk and the unflushed tail from the WAL
         DB db(dir, opt);
         ok &= verify(db, "after reopen");
     }
-    fs::remove_all(dir);
+    std::cout << "files left on disk in " << dir << ":\n";
+    list_files(dir);
     return ok ? 0 : 1;
 }
 
-
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--demo") return demo();
+    return shell(argc > 1 ? argv[1] : "./lsm_data");
+}
