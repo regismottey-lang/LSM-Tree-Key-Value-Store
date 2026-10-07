@@ -26,9 +26,8 @@ Recovery: unfinished .tmp files from a crash are removed on open.
 # Build and run
 g++ -std=c++20 -O2 -Wall -Wextra project10_lsm_kv.cpp -o lsm
 
-./lsm
-
-The demo writes 20,000 keys with a tiny memtable (to force many flushes and compactions), overwrites and deletes subsets, verifies every read, then reopens the database to prove recovery from disk and the WAL. It prints PASS lines. Data goes in ./lsm_demo, which is removed afterward.
+./lsm            # interactive shell; data persists in ./lsm_data
+./lsm --demo     # correctness test: 20,000 keys with flushes, compaction, recovery
 # Known limitations
 Compaction merges all tables in memory and keeps tombstones; a manifest file would make dropping them crash-safe.
 Single writer, no block cache, no range scans.
